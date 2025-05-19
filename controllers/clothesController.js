@@ -40,8 +40,10 @@ const addCloth = async (req, res) => {
     }
   };
 
+
+
   // GET /api/clothes/:id - Belirli kıyafeti getir
-exports.getClothById = async (req, res) => {
+const getClothById = async (req, res) => {
     try {
       const cloth = await Cloth.findById(req.params.id);
       if (!cloth) return res.status(404).json({ message: 'Cloth not found' });
@@ -50,21 +52,23 @@ exports.getClothById = async (req, res) => {
       res.status(500).json({ error: err.message });
     }
   };
+
+      // PUT /api/clothes/:id - Kıyafeti güncelle
+const updateCloth = async (req, res) => {
+  try {
+    const updatedCloth = await Cloth.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    );
+    if (!updatedCloth) return res.status(404).json({ message: 'Cloth not found' });
+    res.json(updatedCloth);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+};
   
-  // PUT /api/clothes/:id - Kıyafeti güncelle
-exports.updateCloth = async (req, res) => {
-    try {
-      const updatedCloth = await Cloth.findByIdAndUpdate(
-        req.params.id,
-        req.body,
-        { new: true, runValidators: true }
-      );
-      if (!updatedCloth) return res.status(404).json({ message: 'Cloth not found' });
-      res.json(updatedCloth);
-    } catch (err) {
-      res.status(400).json({ error: err.message });
-    }
-  };
+
 
 module.exports = {
     getAllClothes,

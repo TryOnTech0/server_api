@@ -18,6 +18,11 @@ app.use(express.json());
 const clothesRoutes = require('./routes/clothes');
 app.use('/api/clothes', clothesRoutes);
 
+const uploadRoutes = require('./routes/upload');
+app.use('/api/upload', uploadRoutes);
+
+app.use('/uploads', express.static('uploads'));
+
 
 
 // Basit ana endpoint
