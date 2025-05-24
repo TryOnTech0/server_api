@@ -1,35 +1,53 @@
-// routes/upload.js
 const express = require('express');
 const router = express.Router();
-const multer = require('multer');
-const path = require('path');
+const { upload } = require('../config/s3');
+const Image = require('../models/Image');
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, path.join(__dirname, '../uploads')); // relative değil, absolute path
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + path.extname(file.originalname);
-    cb(null, 'cloth-' + uniqueSuffix);
+// POST /api/upload
+router.post('/', upload.single('photo'), async (req, res) => {
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded or invalid file type'
+      });
+    }
+
+    // Create new image document
+    const newImage = new Image({
+      originalName: req.file.originalname,
+      fileUrl: req.file.location, // This comes from S3
+      userId: req.body.userId || 'anonymous',
+      metadata: {
+        size: req.file.size,
+        mimeType: req.file.mimetype
+      }
+    });
+
+    // Save to database
+    await newImage.save();
+
+    // Return success response
+    res.status(201).json({
+      success: true,
+      message: 'File uploaded successfully',
+      data: {
+        id: newImage._id,
+        originalName: newImage.originalName,
+        fileUrl: newImage.fileUrl,
+        userId: newImage.userId,
+        uploadDate: newImage.createdAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to upload file'
+    });
   }
-});
-
-const upload = multer({ storage: storage });
-
-//  BURADA "image" POSTMAN'de key olarak girilmek zorunda!
-router.post('/', upload.single('image'), (req, res) => {
-  console.log('req.file:', req.file);
-  console.log('req.body:', req.body);
-
-  if (!req.file) {
-    return res.status(400).json({ message: 'No file uploaded' });
-  }
-
-  res.status(200).json({
-    message: 'Image uploaded successfully',
-    filePath: req.file.path,
-  });
 });
 
 module.exports = router;
-

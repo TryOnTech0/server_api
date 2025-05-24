@@ -1,38 +1,42 @@
+require('dotenv').config();
 const express = require('express');
-const dotenv = require('dotenv');
+const mongoose = require('mongoose');
 const cors = require('cors');
-const connectDB = require('./db');
+const uploadRoutes = require('./routes/upload');
 
-dotenv.config();
-
+// Initialize Express app
 const app = express();
 
-// MongoDB bağlantısı
-connectDB();
-
-app.use(cors());
-app.use(express.json());
+// Middleware
+app.use(cors()); // Enable CORS
+app.use(express.json()); // Parse JSON bodies
 
 // Routes
-
-const clothesRoutes = require('./routes/clothes');
-app.use('/api/clothes', clothesRoutes);
-
-const uploadRoutes = require('./routes/upload');
 app.use('/api/upload', uploadRoutes);
 
-app.use('/uploads', express.static('uploads'));
-
-
-
-// Basit ana endpoint
+// Health check endpoint
 app.get('/', (req, res) => {
-  res.send('Server is running!');
+  res.send('Image Upload API is running');
 });
 
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Error stack:', err.stack);
+  res.status(500).json({
+    success: false,
+    error: err.message || 'Something went wrong!',
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB connected successfully'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Start the server
 const PORT = process.env.PORT || 5000;
-
 app.listen(PORT, () => {
-  console.log(`🚀 Server started on http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
-
