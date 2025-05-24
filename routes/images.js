@@ -1,9 +1,9 @@
 // Import required modules
-const express = require('express'); // Web framework
-const router = express.Router(); // Create a new router instance
-const multer = require('multer'); // Middleware for handling file uploads
-const path = require('path'); // For working with file paths
-const fs = require('fs'); // For file system operations
+const express = require('express');
+const router = express.Router();
+
+// Import S3 upload configuration
+const { upload } = require('../config/s3');
 
 // Import controller functions for handling image operations
 const { 
@@ -13,56 +13,6 @@ const {
   getImagePath,  // Get image file path
   addImage       // Add a new image
 } = require('../controllers/imageController');
-
-/**
- * Configure multer storage for file uploads
- * Defines where and how uploaded files should be stored
- */
-const storage = multer.diskStorage({
-  // Define the destination directory for uploaded files
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, '../uploads');
-    // Create the uploads directory if it doesn't exist
-    if (!fs.existsSync(uploadDir)) {
-      // recursive: true creates parent directories if they don't exist
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    // Return the upload directory path
-    cb(null, uploadDir);
-  },
-  // Define how uploaded files should be named
-  filename: function (req, file, cb) {
-    // Create a unique suffix using current timestamp and random number
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    // Get the file extension from the original filename
-    const extension = path.extname(file.originalname);
-    // Combine prefix, unique suffix, and extension for the new filename
-    cb(null, 'photo_' + uniqueSuffix + extension);
-  }
-});
-
-/**
- * Configure multer middleware with storage options and file validation
- */
-const upload = multer({
-  storage: storage, // Use the storage configuration defined above
-  // Set file size limit (10MB)
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB in bytes
-  },
-  // Validate file types
-  fileFilter: function (req, file, cb) {
-    // Define allowed MIME types
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg'];
-    if (allowedTypes.includes(file.mimetype)) {
-      // Accept the file
-      cb(null, true);
-    } else {
-      // Reject the file with an error
-      cb(new Error('Only .jpeg, .jpg and .png format allowed!'));
-    }
-  }
-});
 
 /**
  * @route   POST /api/images
