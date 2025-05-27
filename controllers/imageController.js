@@ -1,8 +1,30 @@
 // Import the Image model for database operations
 const Image = require('../models/Image');
-// Import the path module for working with file paths
+// Import the path and filesystem modules for working with file paths
 const path = require('path');
+const fs = require('fs').promises;
+const fsSync = require('fs');
 // AWS SDK is imported in the functions that need it to avoid loading it unnecessarily
+const { promisify } = require('util');
+const stream = require('stream');
+const pipeline = promisify(stream.pipeline);
+
+// Helper function to determine storage type from URL
+const getStorageType = (url) => {
+  if (!url) return 'local';
+  return url.includes('amazonaws.com') ? 's3' : 'local';
+};
+
+// Helper to ensure uploads directory exists
+const ensureUploadsDir = async () => {
+  const uploadsDir = path.join(__dirname, '../uploads');
+  try {
+    await fs.access(uploadsDir);
+  } catch (error) {
+    await fs.mkdir(uploadsDir, { recursive: true });
+  }
+  return uploadsDir;
+};
 
 /**
  * @desc    Get all images from the database
@@ -12,16 +34,40 @@ const path = require('path');
  */
 const getAllImages = async (req, res) => {
   try {
-    // Query the database for all images
-    const images = await Image.find();
-    // Return the images as JSON
-    res.json(images);
+    const { search, page = 1, limit = 10 } = req.query;
+    const query = {};
+    
+    // Add search filter if provided
+    if (search) {
+      query.$text = { $search: search };
+    }
+    
+    const options = {
+      page: parseInt(page, 10),
+      limit: parseInt(limit, 10),
+      sort: { createdAt: -1 },
+      select: '-__v -_id -metadata._id'
+    };
+    
+    // Query the database for images with pagination
+    const images = await Image.paginate(query, options);
+    
+    res.json({
+      success: true,
+      data: {
+        images: images.docs,
+        total: images.totalDocs,
+        pages: images.totalPages,
+        page: images.page,
+        limit: images.limit
+      }
+    });
   } catch (error) {
-    // Handle any errors that occur during the database query
     console.error('Error fetching images:', error);
     res.status(500).json({ 
       success: false,
-      error: 'An error occurred while fetching images.' 
+      error: 'An error occurred while fetching images.',
+      details: error.message
     });
   }
 };
@@ -46,25 +92,52 @@ const addImage = async (req, res) => {
     }
 
     // Extract userId and metadata from request body
-    const { userId, metadata } = req.body;
+    const { userId, metadata = {} } = req.body;
+    const storageType = req.body.storageType || 's3';
     
-    // Get the S3 file location and URL
-    const s3File = req.file;
-    const fileUrl = s3File.location; // S3 file URL
-    
-    // Create a new image document
-    const newImage = new Image({
-      originalName: s3File.originalname,  // Original filename
-      fileName: s3File.key,               // S3 object key
-      filePath: fileUrl,                  // Public URL of the file in S3
-      userId: userId || 'anonymous',       // User ID or default to 'anonymous'
+    // Create image data based on storage type
+    const imageData = {
+      originalName: req.file.originalname,
+      fileName: req.file.originalname,
+      userId: userId || 'anonymous',
+      storageType,
       metadata: {
-        ...(metadata ? JSON.parse(metadata) : {}), // Parse metadata if it's a string
-        size: s3File.size,                // File size in bytes
-        mimeType: s3File.mimetype,        // File MIME type
-        storage: 's3',                    // Indicate the storage location
-        bucket: s3File.bucket             // S3 bucket name
+        ...metadata,
+        size: req.file.size,
+        mimeType: req.file.mimetype
       }
+    };
+
+    // Handle S3 storage
+    if (storageType === 's3') {
+      imageData.fileUrl = req.file.location;
+      imageData.metadata.bucket = process.env.S3_BUCKET_NAME;
+      imageData.metadata.storagePath = req.file.key;
+    } 
+    // Handle local storage
+    else {
+      const uploadsDir = await ensureUploadsDir();
+      const fileName = `${Date.now()}-${req.file.originalname}`;
+      const filePath = path.join('uploads', fileName);
+      const fullPath = path.join(__dirname, '..', filePath);
+      
+      // Move the file to the uploads directory
+      await fs.rename(req.file.path, fullPath);
+      
+      imageData.filePath = filePath;
+      imageData.fileUrl = `${req.protocol}://${req.get('host')}/${filePath}`;
+      imageData.metadata.storagePath = filePath;
+    }
+
+    // Create and save the image document
+    const newImage = new Image(imageData);
+    await newImage.save();
+
+    // Return success response with the saved image
+    res.status(201).json({
+      success: true,
+      message: 'Image uploaded successfully',
+      data: newImage
     });
 
     // Save the image to the database
@@ -106,12 +179,18 @@ const addImage = async (req, res) => {
   }
 };
 
-// Delete image from S3 and database
+/**
+ * @desc    Delete an image from storage and database
+ * @route   DELETE /api/images/:id
+ * @access  Public
+ * @param   {string} id - The ID of the image to delete
+ * @returns {Object} Success/error message
+ */
 const deleteImage = async (req, res) => {
   try {
     const { id } = req.params;
     
-    // Find the image first to get the S3 key
+    // Find the image first to get storage details
     const image = await Image.findById(id);
     if (!image) {
       return res.status(404).json({ 
@@ -120,26 +199,58 @@ const deleteImage = async (req, res) => {
       });
     }
 
-    // Delete from S3 if the file is stored there
-    if (image.metadata?.storage === 's3') {
-      const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
-      const { s3 } = require('../config/s3');
-      
-      const deleteParams = {
-        Bucket: image.metadata.bucket,
-        Key: image.fileName // The S3 object key
-      };
-
+    // Handle S3 deletion
+    if (image.storageType === 's3' && image.fileUrl) {
       try {
-        await s3.send(new DeleteObjectCommand(deleteParams));
+        const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+        const { s3 } = require('../config/s3');
+        
+        // Extract key from URL or use stored metadata
+        let key = image.metadata?.storagePath;
+        if (!key && image.fileUrl.includes('amazonaws.com')) {
+          const url = new URL(image.fileUrl);
+          key = url.pathname.substring(1);
+        }
+        
+        if (key) {
+          const deleteParams = {
+            Bucket: image.metadata?.bucket || process.env.S3_BUCKET_NAME,
+            Key: key
+          };
+          
+          await s3.send(new DeleteObjectCommand(deleteParams));
+          console.log(`Successfully deleted ${key} from S3`);
+        }
       } catch (s3Error) {
         console.error('Error deleting file from S3:', s3Error);
         // Continue with database deletion even if S3 deletion fails
+      }
+    } 
+    // Handle local file deletion
+    else if (image.storageType === 'local' && image.filePath) {
+      try {
+        const fullPath = path.join(__dirname, '..', image.filePath);
+        if (fsSync.existsSync(fullPath)) {
+          await fs.unlink(fullPath);
+          console.log(`Successfully deleted local file: ${image.filePath}`);
+          
+          // Try to remove the directory if empty
+          const dirPath = path.dirname(fullPath);
+          try {
+            await fs.rmdir(dirPath);
+          } catch (e) {
+            // Directory not empty, which is fine
+          }
+        }
+      } catch (fsError) {
+        console.error('Error deleting local file:', fsError);
+        // Continue with database deletion even if file deletion fails
       }
     }
 
     // Delete from database
     await Image.findByIdAndDelete(id);
+    console.log(`Successfully deleted image ${id} from database`);
 
     res.status(200).json({ 
       success: true,
@@ -149,64 +260,54 @@ const deleteImage = async (req, res) => {
     console.error('Error deleting image:', error);
     res.status(500).json({ 
       success: false,
-      error: 'An error occurred while deleting the image' 
+      error: 'An error occurred while deleting the image',
+      details: error.message
     });
   }
 };
 
 /**
- * @desc    Get a single image by its ID and serve it directly from S3
+ * @desc    Get a single image by its ID and serve it from the appropriate storage
  * @route   GET /api/images/:id
  * @access  Public
  * @param   {Object} req - Express request object
  * @param   {string} req.params.id - The ID of the image to retrieve
- * @returns {Stream} The image file streamed from S3
+ * @returns {Stream} The image file streamed from storage
  */
 const getImageById = async (req, res) => {
   try {
-    console.log('\n=== GET IMAGE BY ID ===');
-    console.log('Image ID:', req.params.id);
+    const { id } = req.params;
     
     // Find the image by ID
-    const image = await Image.findById(req.params.id);
-    
-    // Log the found image (without sensitive data)
-    console.log('Found image:', {
-      _id: image?._id,
-      fileUrl: image?.fileUrl,
-      filePath: image?.filePath,
-      metadata: image?.metadata
-    });
-    
-    // If image not found, return 404
+    const image = await Image.findById(id);
     if (!image) {
-      console.log('Image not found in database');
       return res.status(404).json({ 
         success: false,
-        error: 'Image not found.' 
+        error: 'Image not found' 
       });
     }
-    
-    // If the image has a fileUrl that points to S3
-    if (image.fileUrl && image.fileUrl.includes('amazonaws.com')) {
-      console.log('Attempting to fetch from S3...');
-      console.log('S3 URL:', image.fileUrl);
-      
+
+    // Handle S3 storage
+    if (image.storageType === 's3' && image.fileUrl) {
       try {
-        // Extract the key from the fileUrl (removing the bucket URL part)
-        const url = new URL(image.fileUrl);
-        const key = url.pathname.substring(1); // Remove the leading '/'
-        console.log('Extracted S3 key:', key);
-        
         const { GetObjectCommand } = require('@aws-sdk/client-s3');
         const { s3 } = require('../config/s3');
         
+        // Extract key from URL or use stored metadata
+        let key = image.metadata?.storagePath;
+        if (!key && image.fileUrl.includes('amazonaws.com')) {
+          const url = new URL(image.fileUrl);
+          key = url.pathname.substring(1);
+        }
+        
+        if (!key) {
+          throw new Error('Could not determine S3 key');
+        }
+        
         const params = {
-          Bucket: process.env.S3_BUCKET_NAME,
+          Bucket: image.metadata?.bucket || process.env.S3_BUCKET_NAME,
           Key: key
         };
-        
-        console.log('S3 GetObject params:', JSON.stringify(params, null, 2));
         
         // Get the file from S3
         const { Body, ContentType } = await s3.send(new GetObjectCommand(params));
@@ -217,28 +318,38 @@ const getImageById = async (req, res) => {
         // Stream the file back to the client
         return Body.pipe(res);
       } catch (s3Error) {
-        console.error('Error fetching file from S3:', s3Error);
-        // Fall through to try other methods
+        console.error('Error fetching from S3:', s3Error);
+        return res.status(500).json({
+          success: false,
+          error: 'Error retrieving image from storage',
+          details: s3Error.message
+        });
+      }
+    } 
+    // Handle local storage
+    else if (image.storageType === 'local' && image.filePath) {
+      try {
+        const fullPath = path.join(__dirname, '..', image.filePath);
+        if (fsSync.existsSync(fullPath)) {
+          return res.sendFile(fullPath, {
+            headers: {
+              'Content-Type': image.metadata?.mimeType || 'application/octet-stream'
+            }
+          });
+        } else {
+          throw new Error('File not found on server');
+        }
+      } catch (fsError) {
+        console.error('Error serving local file:', fsError);
+        return res.status(404).json({
+          success: false,
+          error: 'Image file not found',
+          details: fsError.message
+        });
       }
     }
     
-    // If image has filePath (legacy or direct URL)
-    if (image.filePath) {
-      // If it's a full URL, redirect to it
-      if (image.filePath.startsWith('http')) {
-        return res.redirect(image.filePath);
-      }
-      // If it's a local path, try to serve it
-      const fs = require('fs');
-      const path = require('path');
-      const filePath = path.join(__dirname, '..', image.filePath);
-      
-      if (fs.existsSync(filePath)) {
-        return res.sendFile(filePath);
-      }
-    }
-    
-    // If no valid storage method found
+    // If we get here, the storage type is not supported or file not found
     return res.status(404).json({
       success: false,
       error: 'Image not available in storage'
@@ -250,14 +361,15 @@ const getImageById = async (req, res) => {
     if (error.name === 'CastError') {
       return res.status(400).json({
         success: false,
-        error: 'Invalid image ID format.'
+        error: 'Invalid image ID format'
       });
     }
     
     // Handle other errors
     res.status(500).json({
       success: false,
-      error: 'An error occurred while fetching the image.'
+      error: 'An error occurred while fetching the image',
+      details: error.message
     });
   }
 };
